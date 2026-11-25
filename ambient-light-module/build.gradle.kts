@@ -2,7 +2,7 @@ plugins {
     alias(libs.plugins.android.application)
 }
 
-val ambientModuleVersionName = "1.9.1"
+val ambientModuleVersionName = "1.9.2"
 
 android {
     namespace = "com.geely.monjaro.ambienthook"
@@ -16,7 +16,7 @@ android {
         applicationId = "com.geely.monjaro.ambienthook"
         minSdk = 28
         targetSdk = 36
-        versionCode = 10
+        versionCode = 11
         versionName = ambientModuleVersionName
     }
 
