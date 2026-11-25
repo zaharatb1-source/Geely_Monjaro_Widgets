@@ -290,8 +290,7 @@ public class AmbientLightHook implements IXposedHookLoadPackage {
         } else if ("apply_config".equals(cmd)) {
             EPOCH.incrementAndGet();
             solidModeInitialized = false;
-            publishStatus(buildDiagnosticStatus(cl) + "
-Применён режим: " + activeMode + " (" + stepDelayMs + " мс)");
+            publishStatus(buildDiagnosticStatus(cl) + "\nПрименён режим: " + activeMode + " (" + stepDelayMs + " мс)");
         } else if ("lightshow_builtin".equals(cmd)) {
             publishStatus(triggerBuiltInLightShow(cl));
         } else if ("lightshow_script".equals(cmd)) {
@@ -637,11 +636,8 @@ public class AmbientLightHook implements IXposedHookLoadPackage {
                 showStr = "ошибка: " + t.getMessage();
             }
         }
-        return "LSPosed хук v9 активен в " + hookedPkgName + "!
-IGlyCar: " + carStr + "
-LightingShow: " + showStr
-                + "
-Режим: " + activeMode + " (" + stepDelayMs + " мс, R/G/B 0x2140a8bb/a8b9/a8b8)";
+        return "LSPosed хук v9 активен в " + hookedPkgName + "!\nIGlyCar: " + carStr + "\nLightingShow: " + showStr
+                + "\nРежим: " + activeMode + " (" + stepDelayMs + " мс, R/G/B 0x2140a8bb/a8b9/a8b8)";
     }
 
     private String triggerBuiltInLightShow(ClassLoader cl) {
