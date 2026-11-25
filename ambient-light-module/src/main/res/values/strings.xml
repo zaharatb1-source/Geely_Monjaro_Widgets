@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Monjaro Ambient Light Pro</string>
+    <string name="xposed_description">Динамическая атмосферная подсветка (Радуга, Цветомузыка, Обороты, Климат, Биоритм, Стробоскоп) и световые шоу через системный процесс com.geely.settings.</string>
+</resources>

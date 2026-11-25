@@ -1,0 +1,262 @@
+package com.geely.geely_monjaro_widgets.service
+
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.app.Service
+import android.appwidget.AppWidgetManager
+import android.content.ComponentName
+import android.content.Context
+import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.os.IBinder
+import android.os.SystemClock
+import android.util.Log
+import com.geely.geely_monjaro_widgets.R
+import com.geely.geely_monjaro_widgets.core.CarProperties
+import com.geely.geely_monjaro_widgets.widget.climate.DriverSeatHeatWidgetProvider
+import com.geely.geely_monjaro_widgets.widget.climate.DriverSeatMassageWidgetProvider
+import com.geely.geely_monjaro_widgets.widget.climate.DriverSeatVentWidgetProvider
+import com.geely.geely_monjaro_widgets.widget.climate.PassengerSeatHeatWidgetProvider
+import com.geely.geely_monjaro_widgets.widget.climate.PassengerSeatVentWidgetProvider
+import com.geely.geely_monjaro_widgets.widget.climate.RearDefrostWidgetProvider
+import com.geely.geely_monjaro_widgets.widget.climate.RecirculationWidgetProvider
+import com.geely.geely_monjaro_widgets.widget.climate.SteeringWheelHeatWidgetProvider
+import com.geely.geely_monjaro_widgets.widget.fuel.FuelWidgetProvider
+import com.geely.geely_monjaro_widgets.widget.seat.DriverSeatMemoryWidgetProvider
+import com.geely.geely_monjaro_widgets.widget.seat.PassengerSeatMemoryWidgetProvider
+import com.geely.geely_monjaro_widgets.widget.trunk.TrunkWidgetProvider
+import com.geely.geely_monjaro_widgets.widget.wipers.WiperServiceWidgetProvider
+import com.geely.os.car.ConnectionListener
+import com.geely.os.car.GlyCar
+import com.geely.os.car.GlyCarSensorWatcher
+import com.geely.os.car.GlyCarValueWatcher
+import com.geely.os.car.IGlyCar
+
+/**
+ * Фоновый сервис: держит соединение с машиной и подписывается на изменения
+ * свойств. При изменении (в т.ч. через штатное меню) обновляет соответствующие
+ * виджеты, которые перечитывают своё актуальное состояние.
+ *
+ * Виджет-провайдер — это broadcast-receiver и не живёт постоянно, поэтому live-
+ * синхронизация требует отдельного долгоживущего компонента.
+ */
+class CarStateService : Service() {
+
+    private var car: IGlyCar? = null
+
+    /** Когда в последний раз начинали подключение — чтобы не рвать попытку «в полёте». */
+    private var lastConnectAttemptAt = 0L
+
+    /** Свойства, за которыми следим; провайдеры, зависящие от них, — в [providersFor]. */
+    private val watchedProperties = CarProperties.WATCHED_PROPERTIES
+
+    /** Сенсоры, за которыми следим (топливо — обновляет FuelWidgetProvider). */
+    private val watchedSensors = CarProperties.WATCHED_SENSORS
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onCreate() {
+        super.onCreate()
+        startForegroundNotification()
+        connect()
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // Не только когда моста нет, но и когда связь разорвана: liveCar сбрасывается
+        // в onDisConnected, а car при этом остаётся не-null.
+        if (car == null || liveCar == null) reconnectIfStale()
+        if (intent?.action == ACTION_RELAY) relayToProvider(intent)
+        return START_STICKY
+    }
+
+    /**
+     * Доставляет действие клика провайдеру виджета уже в «тёплом» процессе.
+     * Запуск через getForegroundService не задерживается системой (в отличие от
+     * broadcast в закэшированный процесс), поэтому клики срабатывают сразу.
+     */
+    private fun relayToProvider(intent: Intent) {
+        val target = intent.getStringExtra(EXTRA_TARGET) ?: return
+        val relayAction = intent.getStringExtra(EXTRA_RELAY_ACTION) ?: return
+        val forward = Intent(relayAction).apply {
+            component = ComponentName(this@CarStateService, target)
+            intent.extras?.let { putExtras(it) }
+        }
+        sendBroadcast(forward)
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        liveCar = null
+        car?.unregisterValueWatcher()
+        car?.unregisterSensorWatcher()
+        car?.disconnect()
+        car = null
+    }
+
+    /**
+     * Пересоздаёт мост, если предыдущая попытка подключения уже «протухла».
+     * onStartCommand вызывается на каждый клик, поэтому без этой защиты мы рвали бы
+     * соединение, которое ещё только устанавливается, и оно не поднялось бы никогда.
+     */
+    private fun reconnectIfStale() {
+        if (SystemClock.elapsedRealtime() - lastConnectAttemptAt < CONNECT_GRACE_MS) return
+        val previous = car
+        if (previous != null) {
+            try {
+                previous.unregisterValueWatcher()
+                previous.unregisterSensorWatcher()
+                previous.disconnect()
+            } catch (t: Throwable) {
+                Log.w(TAG, "cleanup of previous connection failed", t)
+            }
+            car = null
+        }
+        connect()
+    }
+
+    private fun connect() {
+        lastConnectAttemptAt = SystemClock.elapsedRealtime()
+        car = GlyCar.create(applicationContext, object : ConnectionListener {
+            override fun onConnected() {
+                car?.registerValueWatcher(watchedProperties, watcher)
+                car?.registerSensorWatcher(watchedSensors, sensorWatcher)
+                liveCar = car
+            }
+
+            override fun onDisConnected() {
+                liveCar = null
+            }
+        })
+    }
+
+    private val watcher = GlyCarValueWatcher { propertyId, _ ->
+        for (provider in providersFor(propertyId)) {
+            updateProvider(provider)
+        }
+    }
+
+    /** Любой из топливных сенсоров изменился → обновляем виджет топлива. */
+    private val sensorWatcher = GlyCarSensorWatcher { _, _ ->
+        updateProvider(FuelWidgetProvider::class.java)
+    }
+
+    private fun providersFor(propertyId: Int): List<Class<*>> = when (propertyId) {
+        CarProperties.WIPER_SERVICE_POSITION -> listOf(WiperServiceWidgetProvider::class.java)
+        CarProperties.TRUNK_STATE -> listOf(TrunkWidgetProvider::class.java)
+        CarProperties.SEAT_HEATING -> listOf(
+            DriverSeatHeatWidgetProvider::class.java,
+            PassengerSeatHeatWidgetProvider::class.java,
+        )
+        CarProperties.SEAT_VENTILATION -> listOf(
+            DriverSeatVentWidgetProvider::class.java,
+            PassengerSeatVentWidgetProvider::class.java,
+        )
+        CarProperties.SEAT_MASSAGE,
+        CarProperties.SEAT_MASSAGE_SWITCH -> listOf(DriverSeatMassageWidgetProvider::class.java)
+        CarProperties.STEERING_WHEEL_HEATING -> listOf(SteeringWheelHeatWidgetProvider::class.java)
+        CarProperties.AIR_CIRCULATION -> listOf(RecirculationWidgetProvider::class.java)
+        CarProperties.DEFROST_REAR -> listOf(RearDefrostWidgetProvider::class.java)
+        CarProperties.SEAT_POSITION_RESTORE -> listOf(
+            DriverSeatMemoryWidgetProvider::class.java,
+            PassengerSeatMemoryWidgetProvider::class.java,
+        )
+        else -> emptyList()
+    }
+
+    /** Триггерит onUpdate провайдера — он перечитает состояние и перерисуется. */
+    private fun updateProvider(provider: Class<*>) {
+        val manager = AppWidgetManager.getInstance(this)
+        val ids = manager.getAppWidgetIds(ComponentName(this, provider))
+        if (ids.isEmpty()) return
+        val intent = Intent(this, provider).apply {
+            action = AppWidgetManager.ACTION_APPWIDGET_UPDATE
+            putExtra(AppWidgetManager.EXTRA_APPWIDGET_IDS, ids)
+        }
+        sendBroadcast(intent)
+    }
+
+    private fun startForegroundNotification() {
+        val manager = getSystemService(NotificationManager::class.java)
+        val channel = NotificationChannel(
+            CHANNEL_ID,
+            "Состояние машины",
+            NotificationManager.IMPORTANCE_MIN,
+        )
+        manager.createNotificationChannel(channel)
+        val notification: Notification = Notification.Builder(this, CHANNEL_ID)
+            .setContentTitle("Monjaro Widgets")
+            .setContentText("Синхронизация состояния виджетов")
+            .setSmallIcon(R.mipmap.ic_launcher)
+            .setOngoing(true)
+            .build()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            startForeground(
+                NOTIFICATION_ID,
+                notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE,
+            )
+        } else {
+            startForeground(NOTIFICATION_ID, notification)
+        }
+    }
+
+    companion object {
+        @Volatile
+        var liveCar: IGlyCar? = null
+            private set
+
+        private const val TAG = "CarStateService"
+        private const val CHANNEL_ID = "car_state_sync"
+        private const val NOTIFICATION_ID = 1
+
+        /** Сколько ждём результата подключения, прежде чем считать попытку протухшей. */
+        private const val CONNECT_GRACE_MS = 10_000L
+
+        private const val ACTION_RELAY = "com.geely.geely_monjaro_widgets.action.RELAY"
+        private const val EXTRA_TARGET = "com.geely.geely_monjaro_widgets.extra.TARGET"
+        private const val EXTRA_RELAY_ACTION = "com.geely.geely_monjaro_widgets.extra.RELAY_ACTION"
+
+        /** Запускает сервис, если ещё не запущен (idempotent). */
+        fun ensureStarted(context: Context) {
+            try {
+                val intent = Intent(context, CarStateService::class.java)
+                context.startForegroundService(intent)
+            } catch (t: Throwable) {
+                Log.w(TAG, "ensureStarted failed", t)
+            }
+        }
+
+        /**
+         * PendingIntent клика виджета: запускает foreground-сервис (быстрый путь,
+         * греет процесс), который ретранслирует [action] провайдеру [target].
+         * [uniqueTag] делает PendingIntent уникальным (filterEquals игнорирует extras).
+         */
+        fun actionPendingIntent(
+            context: Context,
+            requestCode: Int,
+            target: Class<*>,
+            action: String,
+            uniqueTag: String,
+            extras: Bundle? = null,
+        ): PendingIntent {
+            val intent = Intent(context, CarStateService::class.java).apply {
+                this.action = ACTION_RELAY
+                data = Uri.parse("monjarowidget://$uniqueTag")
+                putExtra(EXTRA_TARGET, target.name)
+                putExtra(EXTRA_RELAY_ACTION, action)
+                if (extras != null) putExtras(extras)
+            }
+            return PendingIntent.getForegroundService(
+                context,
+                requestCode,
+                intent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+            )
+        }
+    }
+}

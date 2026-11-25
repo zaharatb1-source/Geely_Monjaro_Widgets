@@ -1,0 +1,43 @@
+package com.geely.os.car;
+
+public interface IGlyCar {
+    int getIntProperty(int propertyId, int areaId);
+    boolean setIntProperty(int propertyId, int areaId, int value);
+
+    /** Варианты без зоны — для свойств с одной зоной (например подогрев руля). */
+    int getIntProperty(int propertyId);
+    boolean setIntProperty(int propertyId, int value);
+
+    float getFloatProperty(int propertyId, int areaId);
+    boolean setFloatProperty(int propertyId, int areaId, float value);
+
+    /** Чтение значения сенсора (например уровень топлива в %). */
+    float getSensorValue(int sensorType);
+
+    /**
+     * Ёмкость топливного бака в литрах из данных машины (ICarInfo). 0, если машина
+     * не сообщает значение — тогда используется запасная константа.
+     */
+    float getFuelTankCapacityLiters();
+
+    /**
+     * Имя FunctionStatus: "active" | "notactive" | "notavailable" | "error",
+     * либо null, если определить не удалось. Возвращаем строку, а не boolean:
+     * решение «доступна ли функция» принимает вызывающий виджет (см.
+     * CarProperties.isKnownInactive), а не этот мост.
+     */
+    String supportStatus(int propertyId);
+    String supportStatus(int propertyId, int areaId);
+
+    /** Подписка на изменения значений указанных свойств. */
+    boolean registerValueWatcher(int[] propertyIds, GlyCarValueWatcher watcher);
+    /** Снять ранее зарегистрированную подписку. */
+    void unregisterValueWatcher();
+
+    /** Подписка на изменения значений указанных сенсоров (например уровень топлива). */
+    boolean registerSensorWatcher(int[] sensorTypes, GlyCarSensorWatcher watcher);
+    /** Снять ранее зарегистрированную подписку на сенсоры. */
+    void unregisterSensorWatcher();
+
+    void disconnect();
+}
